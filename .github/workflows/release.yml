@@ -6,17 +6,34 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: web-ui/pnpm-lock.yaml
+
+      - name: Install web-ui dependencies
+        working-directory: web-ui
+        run: pnpm install --frozen-lockfile
 
       - name: Gradle cache
         uses: actions/cache@v4
@@ -27,24 +44,109 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
 
       - name: Prepare build files
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          SIGNING_CONFIG: ${{ secrets.SIGNING_CONFIG }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          WORKSPACE: ${{ github.workspace }}
         run: |
-          # 解码base64编码的keystore文件
-          echo "${{ secrets.KEY_BASE64 }}" | base64 -d > app/app.key
-          
-          # 写入签名配置到local.properties
-          echo "${{ secrets.SIGNING_CONFIG }}" > local.properties
-          
-          # 写入Google Services配置
-          echo '${{ secrets.GOOGLE_SERVICES_JSON }}' > app/google-services.json
+          set -e
+
+          # ---------- 签名配置 ----------
+          if [ -n "$KEY_BASE64" ] && [ -n "$SIGNING_CONFIG" ]; then
+            echo "$KEY_BASE64" | base64 -d > app/app.key
+            printf '%s\n' "$SIGNING_CONFIG" > local.properties
+            echo "✅ Signing config from repository secrets"
+          else
+            echo "⚠️ No signing secrets — generating an ephemeral keystore for this run"
+            KEYSTORE_PASS="rikkahub-fork-$(openssl rand -hex 8)"
+            keytool -genkeypair \
+              -alias rikkahub \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 36500 \
+              -storepass "$KEYSTORE_PASS" \
+              -keypass  "$KEYSTORE_PASS" \
+              -dname "CN=RikkaHub Fork, O=Fork, C=CN" \
+              -keystore app/app.key
+
+            cat > local.properties <<EOF
+          storeFile=${WORKSPACE}/app/app.key
+          storePassword=${KEYSTORE_PASS}
+          keyAlias=rikkahub
+          keyPassword=${KEYSTORE_PASS}
+          EOF
+
+            # 把密钥材料留下，方便后续手动配为 secret 实现固定签名
+            mkdir -p signing-output
+            base64 -w0 app/app.key > signing-output/KEY_BASE64.txt
+            cp local.properties signing-output/SIGNING_CONFIG.txt
+            cat > signing-output/README.md <<'EOF'
+          # 固定签名说明
+
+          本次 build 使用了自动生成的临时密钥。每次 workflow 跑都会生成不同密钥，
+          这意味着前后两次产出的 APK 之间 **无法增量升级**（必须卸载重装）。
+
+          如果想让所有 release 共用同一个签名，把本目录两个文件配置为仓库 Secret：
+
+          1. 仓库 Settings → Secrets and variables → Actions → New repository secret
+          2. 添加 `KEY_BASE64`：值 = `KEY_BASE64.txt` 内单行 base64 文本
+          3. 添加 `SIGNING_CONFIG`：值 = `SIGNING_CONFIG.txt` 全文
+          4. 下次跑 workflow 就会自动改用这套固定密钥
+          EOF
+          fi
+
+          # ---------- Google Services ----------
+          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            printf '%s\n' "$GOOGLE_SERVICES_JSON" > app/google-services.json
+            echo "✅ Real google-services.json"
+          else
+            echo "⚠️ Using placeholder google-services.json (Firebase runtime disabled)"
+            cat > app/google-services.json <<'EOF'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "rikkahub-fork-placeholder",
+              "storage_bucket": "rikkahub-fork-placeholder.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "me.rerere.rikkahub"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  { "current_key": "AIzaSyA-PLACEHOLDER-PLACEHOLDER-PLACEHOLD" }
+                ],
+                "services": {
+                  "appinvite_service": { "other_platform_oauth_client": [] }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          fi
 
       - name: Gradle Build
         run: |
           chmod +x gradlew
           ./gradlew assembleRelease
 
-      - name: Upload artifacts
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: artifacts
+          name: apk-release
           path: app/build/outputs/apk/release/*.apk
+
+      - name: Upload signing material (only if auto-generated)
+        uses: actions/upload-artifact@v4
+        if: success() && hashFiles('signing-output/*') != ''
+        with:
+          name: signing-output
+          path: signing-output/
+          retention-days: 7
